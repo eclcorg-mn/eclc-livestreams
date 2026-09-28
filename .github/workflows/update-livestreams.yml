@@ -1,0 +1,165 @@
+name: Update ECLC livestreams
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/update-livestreams.yml'
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: eclc-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Build the livestream page
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import html
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode
+          from urllib.request import urlopen
+          from zoneinfo import ZoneInfo
+          
+          
+          def api(resource, **params):
+              key = os.environ.get('YOUTUBE_API_KEY', '').strip()
+              if not key:
+                  raise RuntimeError('Add the YOUTUBE_API_KEY repository Actions secret, then run again.')
+              url = 'https://www.googleapis.com/youtube/v3/' + resource + '?' + urlencode(dict(params, key=key))
+              for attempt in range(3):
+                  try:
+                      with urlopen(url, timeout=30) as response:
+                          return json.load(response)
+                  except HTTPError as exc:
+                      if exc.code >= 500 and attempt < 2:
+                          time.sleep(2 ** attempt)
+                          continue
+                      # Never print the request URL, which contains the key.
+                      raise RuntimeError('YouTube API returned HTTP %s. Check API enablement, key restrictions and quota.' % exc.code) from None
+                  except (URLError, TimeoutError):
+                      if attempt < 2:
+                          time.sleep(2 ** attempt)
+                          continue
+                      raise RuntimeError('YouTube could not be reached. Run the workflow again later.') from None
+          
+          
+          def timestamp(value):
+              return datetime.fromisoformat(value.replace('Z', '+00:00'))
+          
+          
+          def latest_streams():
+              channels = api('channels', part='contentDetails', forHandle='@eclccinema').get('items', [])
+              if len(channels) != 1:
+                  raise RuntimeError('Could not resolve @eclccinema to one channel.')
+              channel = channels[0]
+              playlist = channel['contentDetails']['relatedPlaylists']['uploads']
+              found = {}
+              token = ''
+              seen_tokens = set()
+              # Inspect all uploads so a broadcast scheduled long ago is still ordered
+              # by its actual start time, rather than the video creation date.
+              for page_number in range(200):
+                  page = api('playlistItems', part='contentDetails', playlistId=playlist,
+                             maxResults=50, **({'pageToken': token} if token else {}))
+                  ids = [item['contentDetails']['videoId'] for item in page.get('items', [])]
+                  if ids:
+                      videos = api('videos', part='snippet,status,liveStreamingDetails', id=','.join(ids))
+                      for video in videos.get('items', []):
+                          details = video.get('liveStreamingDetails', {})
+                          status = video.get('status', {})
+                          if (details.get('actualStartTime') and details.get('actualEndTime')
+                                  and status.get('privacyStatus') == 'public'
+                                  and video.get('snippet', {}).get('channelId') == channel['id']
+                                  and re.fullmatch(r'[A-Za-z0-9_-]{11}', video.get('id', ''))):
+                              found[video['id']] = video
+                  token = page.get('nextPageToken', '')
+                  if not token:
+                      break
+                  if token in seen_tokens:
+                      raise RuntimeError('YouTube returned a repeated page token; keeping the current page.')
+                  seen_tokens.add(token)
+              else:
+                  raise RuntimeError('Channel scan exceeded its limit; keeping the current page.')
+              latest = sorted(found.values(), key=lambda v: timestamp(v['liveStreamingDetails']['actualStartTime']), reverse=True)[:3]
+              if len(latest) != 3:
+                  raise RuntimeError('YouTube returned fewer than three completed public broadcasts; keeping the current page.')
+              return latest
+          
+          
+          def render(videos):
+              sections = []
+              for video in videos:
+                  when = timestamp(video['liveStreamingDetails']['actualStartTime']).astimezone(ZoneInfo('America/Chicago'))
+                  label = when.strftime('%A, %B ') + str(when.day) + when.strftime(', %Y')
+                  title = html.escape(video['snippet']['title'], quote=True)
+                  video_id = video['id']
+                  if video['status'].get('embeddable'):
+                      player = (f'<iframe src="https://www.youtube.com/embed/{video_id}" '
+                                f'title="{title}" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" '
+                                'allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>')
+                  else:
+                      player = (f'<p>This livestream is available on YouTube: '
+                                f'<a href="https://www.youtube.com/watch?v={video_id}" target="_blank" rel="noopener">{title}</a></p>')
+                  sections.append(f'<section><h2><time datetime="{when.date().isoformat()}">{label}</time></h2>{player}</section>')
+              return '''<!doctype html>
+          <html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>ECLC — Recent Livestreams</title>
+          <meta name="description" content="Watch the three most recent completed ECLC livestreams.">
+          <style>
+          *{box-sizing:border-box}body{margin:0;padding:8px;color:#222;background:#fff;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5}
+          main{max-width:800px;margin:0 auto}section{margin:0 0 28px}h2{font-size:1.125rem;margin:0 0 12px;font-weight:700}
+          iframe{display:block;width:100%;aspect-ratio:16/9;border:0;background:#000}a{color:#174c91}
+          </style></head><body><main aria-label="Recent livestreams">''' + '\n'.join(sections) + '</main></body></html>\n'
+          
+          
+          def main():
+              page = render(latest_streams())
+              output = Path('public')
+              output.mkdir(exist_ok=True)
+              (output / 'index.html').write_text(page, encoding='utf-8')
+              print('Built the page with three completed livestreams.')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as exc:
+                  # Log only our controlled messages, never raw request exceptions.
+                  print(str(exc) if isinstance(exc, RuntimeError) else 'Build failed; the existing published page has not been replaced.', file=sys.stderr)
+                  sys.exit(1)
+          PYTHON
+      - name: Upload the finished page
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - name: Publish the page
+        id: deployment
+        uses: actions/deploy-pages@v4
